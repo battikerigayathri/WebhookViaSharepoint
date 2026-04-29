@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>OCR and Table Test Document</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }
+  table { border-collapse: collapse; width: 100%; margin-top: 20px; }
+  th, td { border: 1px solid #dddddd; text-align: left; padding: 8px; }
+  th { background-color: #f2f2f2; }
+  .image-container { margin: 20px 0; border: 2px dashed #ccc; padding: 10px; display: inline-block; }
+</style>
+</head>
+<body>
+
+<h1>OCR and Table Extraction Test</h1>
+
+<p>This document is designed to test whether your AI embedding pipeline correctly extracts text from paragraphs, tables, and images.</p>
+
+<h2>1. Standard Text</h2>
+<p>This is a standard paragraph of text. The AI should have no problem reading this. To test this section, ask the AI: <strong>"What is the secret text code?"</strong></p>
+<p><strong>Secret Text Code: ALPHA-TANGO-99</strong></p>
+
+<h2>2. Data Table</h2>
+<p>Below is a table of fictional employee data. To test if your AI can read rows and columns properly, ask: <strong>"What is the role of Jane Smith?"</strong> or <strong>"Which department does Alice work in?"</strong></p>
+<table>
+  <tr>
+    <th>Employee ID</th>
+    <th>Name</th>
+    <th>Department</th>
+    <th>Role</th>
+  </tr>
+  <tr>
+    <td>E-1001</td>
+    <td>John Doe</td>
+    <td>Engineering</td>
+    <td>Backend Developer</td>
+  </tr>
+  <tr>
+    <td>E-1002</td>
+    <td>Jane Smith</td>
+    <td>Marketing</td>
+    <td>SEO Specialist</td>
+  </tr>
+  <tr>
+    <td>E-1003</td>
+    <td>Alice Johnson</td>
+    <td>Human Resources</td>
+    <td>HR Manager</td>
+  </tr>
+</table>
+
+<h2>3. Image with Text (OCR Test)</h2>
+<p>Below is an image that contains text. If your pipeline supports Vision/OCR, the AI will be able to read the text inside this picture. To test this, ask the AI: <strong>"What is the invoice number and total amount shown in the image?"</strong></p>
+
+<div class="image-container">
+  <!-- This is an image generated locally containing text -->
+  <img src="C:\Users\vithi\.gemini\antigravity\brain\5e03fa5f-1c02-4f7d-88c9-b015f30aa5ac\test_invoice_image_1777357611754.png" alt="Invoice Test Image" style="max-width: 100%; height: auto;" />
+</div>
+
+<p><em>End of Test Document</em></p>
+
+</body>
+</html>

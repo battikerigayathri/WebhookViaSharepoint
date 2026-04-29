@@ -1,5 +1,5 @@
 import { Client } from "@microsoft/microsoft-graph-client";
-import { getAccessToken } from "./auth";
+import { getAccessToken } from "./auth.js";
 import dotenv from "dotenv";
 dotenv.config();
 async function createSubscription() {

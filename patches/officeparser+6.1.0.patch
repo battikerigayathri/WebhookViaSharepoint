@@ -1,0 +1,46 @@
+diff --git a/node_modules/officeparser/dist/parsers/PdfParser.js b/node_modules/officeparser/dist/parsers/PdfParser.js
+index 33bcf1a..1033921 100644
+--- a/node_modules/officeparser/dist/parsers/PdfParser.js
++++ b/node_modules/officeparser/dist/parsers/PdfParser.js
+@@ -743,8 +743,11 @@ const parsePdf = async (buffer, config) => {
+                         if (config.ocr) {
+                             try {
+                                 // Skip OCR for very small images/artifacts (e.g. < 10px) to avoid Tesseract warnings
+-                                if (item.width >= 10 && item.height >= 10) {
++                                // ALSO skip massive background graphics (> 2,000,000 pixels) to prevent CPU freezing
++                                if (item.width >= 10 && item.height >= 10 && (item.width * item.height) <= 2000000) {
+                                     attachment.ocrText = (await (0, ocrUtils_js_1.performOcr)(bmpBuffer, { language: config.ocrLanguage, ...config.ocrConfig })).trim();
++                                } else if ((item.width * item.height) > 2000000) {
++                                    console.log(`\r[OCR] Skipping massive background image (${item.width}x${item.height}) to save time.`);
+                                 }
+                             }
+                             catch (e) {
+diff --git a/node_modules/officeparser/dist/utils/ocrUtils.js b/node_modules/officeparser/dist/utils/ocrUtils.js
+index 4ccdb43..93812f8 100644
+--- a/node_modules/officeparser/dist/utils/ocrUtils.js
++++ b/node_modules/officeparser/dist/utils/ocrUtils.js
+@@ -27,7 +27,7 @@ class OcrSchedulerManager {
+     static instance;
+     pool = [];
+     queue = [];
+-    MAX_WORKERS = 4;
++    MAX_WORKERS = 1; // Changed to 1 to prevent Tesseract race conditions
+     idleTimeout = 10000; // 10s default
+     timeoutId = null;
+     constructor() { }
+@@ -94,7 +94,14 @@ class OcrSchedulerManager {
+         if (!managed && this.pool.length < this.MAX_WORKERS) {
+             try {
+                 const { createWorker } = await import('tesseract.js');
+-                const options = { logger: () => { } };
++                const options = { logger: (m) => { 
++                    if (m.status === 'recognizing text') {
++                        process.stdout.write(`\r[OCR] Processing image... ${(m.progress * 100).toFixed(0)}%    `);
++                        if (m.progress === 1) console.log('');
++                    } else {
++                        console.log(`[OCR] ${m.status} (${m.progress})`);
++                    }
++                } };
+                 if (nextJob.config.workerPath)
+                     options.workerPath = nextJob.config.workerPath;
+                 if (nextJob.config.corePath)

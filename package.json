@@ -10,7 +10,8 @@
     "build": "tsc",
     "subscribe": "tsx src/subscription.ts",
     "resolve-ids": "tsx src/resolve-ids.ts",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "postinstall": "patch-package"
   },
   "keywords": [],
   "author": "",
@@ -19,6 +20,8 @@
     "@types/express": "^5.0.6",
     "@types/node": "^25.6.0",
     "@types/uuid": "^10.0.0",
+    "patch-package": "^8.0.1",
+    "postinstall-postinstall": "^2.1.0",
     "ts-node": "^10.9.2",
     "tsx": "^4.21.0",
     "typescript": "^6.0.3"
@@ -29,6 +32,7 @@
     "axios": "^1.15.2",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "officeparser": "^6.1.0",
     "uuid": "^14.0.0"
   }
 }
