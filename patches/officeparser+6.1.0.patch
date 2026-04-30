@@ -1,22 +1,304 @@
 diff --git a/node_modules/officeparser/dist/parsers/PdfParser.js b/node_modules/officeparser/dist/parsers/PdfParser.js
-index 33bcf1a..1033921 100644
+index 33bcf1a..e1c96b3 100644
 --- a/node_modules/officeparser/dist/parsers/PdfParser.js
 +++ b/node_modules/officeparser/dist/parsers/PdfParser.js
-@@ -743,8 +743,11 @@ const parsePdf = async (buffer, config) => {
-                         if (config.ocr) {
-                             try {
-                                 // Skip OCR for very small images/artifacts (e.g. < 10px) to avoid Tesseract warnings
--                                if (item.width >= 10 && item.height >= 10) {
-+                                // ALSO skip massive background graphics (> 2,000,000 pixels) to prevent CPU freezing
-+                                if (item.width >= 10 && item.height >= 10 && (item.width * item.height) <= 2000000) {
-                                     attachment.ocrText = (await (0, ocrUtils_js_1.performOcr)(bmpBuffer, { language: config.ocrLanguage, ...config.ocrConfig })).trim();
-+                                } else if ((item.width * item.height) > 2000000) {
-+                                    console.log(`\r[OCR] Skipping massive background image (${item.width}x${item.height}) to save time.`);
+@@ -255,6 +255,134 @@ function convertToRgbaBuffer(data, width, height, kind) {
+     }
+     return Buffer.from(rgbaData.buffer, rgbaData.byteOffset, rgbaData.byteLength);
+ }
++/**
++ * Downscales RGBA pixel data to fit within maxDimension pixels on its longest side.
++ * Uses nearest-neighbor sampling which is fast and adequate for OCR text extraction.
++ * Critical for 200+ slide PDFs: reduces memory from ~23MB to ~5MB per image.
++ *
++ * @param data - RGBA pixel data (Uint8Array or Uint8ClampedArray)
++ * @param srcWidth - Source image width
++ * @param srcHeight - Source image height
++ * @param maxDim - Maximum dimension (width or height) in pixels
++ * @returns Object with downscaled data, width, and height
++ */
++function downscaleForOcr(data, srcWidth, srcHeight, maxDim) {
++    if (Math.max(srcWidth, srcHeight) <= maxDim) {
++        return { data, width: srcWidth, height: srcHeight };
++    }
++    const scale = maxDim / Math.max(srcWidth, srcHeight);
++    const dstWidth = Math.max(1, Math.round(srcWidth * scale));
++    const dstHeight = Math.max(1, Math.round(srcHeight * scale));
++    const dst = new Uint8ClampedArray(dstWidth * dstHeight * 4);
++    for (let y = 0; y < dstHeight; y++) {
++        const srcY = Math.min(Math.floor(y / scale), srcHeight - 1);
++        for (let x = 0; x < dstWidth; x++) {
++            const srcX = Math.min(Math.floor(x / scale), srcWidth - 1);
++            const srcIdx = (srcY * srcWidth + srcX) * 4;
++            const dstIdx = (y * dstWidth + x) * 4;
++            dst[dstIdx] = data[srcIdx];
++            dst[dstIdx + 1] = data[srcIdx + 1];
++            dst[dstIdx + 2] = data[srcIdx + 2];
++            dst[dstIdx + 3] = data[srcIdx + 3];
++        }
++    }
++    return { data: dst, width: dstWidth, height: dstHeight };
++}
++/**
++ * Converts RGBA pixel data to high-contrast grayscale for better OCR accuracy.
++ * Colored text (red headers, blue links) has poor contrast in RGB but becomes
++ * clearly visible in grayscale. Uses BT.601 luminance coefficients.
++ *
++ * Example: Red text (255,0,0) → gray value 76 (dark) on white 255 = high contrast.
++ */
++function convertToGrayscaleForOcr(data, width, height) {
++    const result = new Uint8ClampedArray(data.length);
++    for (let i = 0; i < width * height; i++) {
++        const idx = i * 4;
++        const r = data[idx];
++        const g = data[idx + 1];
++        const b = data[idx + 2];
++        const a = data[idx + 3];
++        // BT.601 luminance (standard grayscale conversion)
++        const gray = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
++        result[idx] = gray;
++        result[idx + 1] = gray;
++        result[idx + 2] = gray;
++        result[idx + 3] = a;
++    }
++    return result;
++}
++/**
++ * Renders a PDF page to a PNG buffer for OCR using @napi-rs/canvas.
++ *
++ * We rely on @napi-rs/canvas's native PNG encoder (`canvas.encode('png')`) which
++ * is much faster than encoding via JS-side BMP/grayscale loops AND produces a
++ * format Tesseract.js accepts directly. We also fill the canvas with white first
++ * because PDF pages are transparent, so transparent renders end up as a black
++ * page after RGBA->grayscale flattening, which gives empty OCR.
++ *
++ * @param page - The PDF.js page proxy
++ * @param maxDim - Max dimension (px) on the longest side of the rendered image.
++ *                 Capped at scale 3.0 to avoid huge images that slow OCR.
++ * @returns Object with `pngBuffer` (ready for Tesseract), width and height.
++ */
++async function renderPageToImage(page, maxDim = 2400) {
++    let canvas;
++    try {
++        canvas = require('@napi-rs/canvas');
++    } catch (e) {
++        throw new Error("The '@napi-rs/canvas' package is required for Page OCR. Run 'npm install @napi-rs/canvas'.");
++    }
++    const initialViewport = page.getViewport({ scale: 1.0 });
++    // Cap scale at 5.0 — large slide PDFs benefit from extra resolution for small/stylized
++    // text (logos, banner titles) which can otherwise be skipped by Tesseract.
++    const scale = Math.min(maxDim / Math.max(initialViewport.width, initialViewport.height), 5.0);
++    const viewport = page.getViewport({ scale });
++    const width = Math.ceil(viewport.width);
++    const height = Math.ceil(viewport.height);
++    const nodeCanvas = canvas.createCanvas(width, height);
++    const context = nodeCanvas.getContext('2d');
++    // PDF pages are transparent by default. Fill white so OCR sees black-on-white.
++    context.fillStyle = '#ffffff';
++    context.fillRect(0, 0, width, height);
++    context.imageSmoothingEnabled = true;
++    context.imageSmoothingQuality = 'high';
++    await page.render({
++        canvasContext: context,
++        viewport: viewport,
++        intent: 'print',
++    }).promise;
++    // Post-process for OCR: convert to high-contrast grayscale.
++    // Colored headers (red/orange title bars, blue/teal CTAs) and gray/light logos
++    // often have mediocre RGB contrast against their backgrounds, which causes
++    // Tesseract to drop them. Flattening to grayscale via BT.601 luminance and
++    // applying a mild contrast stretch (1.25x around 128) sharpens text edges
++    // without crushing anti-aliasing.
++    const imgData = context.getImageData(0, 0, width, height);
++    const px = imgData.data;
++    const contrast = 1.25;
++    const intercept = 128 * (1 - contrast);
++    for (let i = 0; i < px.length; i += 4) {
++        const r = px[i];
++        const g = px[i + 1];
++        const b = px[i + 2];
++        // BT.601 luminance
++        let gray = 0.299 * r + 0.587 * g + 0.114 * b;
++        gray = contrast * gray + intercept;
++        if (gray < 0) gray = 0;
++        else if (gray > 255) gray = 255;
++        px[i] = px[i + 1] = px[i + 2] = gray;
++    }
++    context.putImageData(imgData, 0, 0);
++    // Use @napi-rs/canvas's native PNG encoder. Tesseract.js accepts PNG buffers
++    // directly, so we skip the JS-side BMP encoder + grayscale conversion entirely.
++    const pngBuffer = await nodeCanvas.encode('png');
++    return {
++        pngBuffer,
++        width,
++        height
++    };
++}
+ /**
+  * Parses a PDF file and extracts content.
+  *
+@@ -534,16 +662,36 @@ const parsePdf = async (buffer, config) => {
+                                             break;
+                                         }
+                                     }
+-                                    pageItems.push({
+-                                        type: 'image',
+-                                        x: imgX,
+-                                        y: imgY,
+-                                        name: imgName,
+-                                        data: imgObj.data,
+-                                        width: imgObj.width,
+-                                        height: imgObj.height,
+-                                        kind: imgObj.kind
+-                                    });
++                                    // Downscale large images immediately to save memory.
++                                    // A 200-slide PDF with 3192x1806 images would use ~4.6GB without this.
++                                    // Downscaling to max 1500px reduces per-image memory from ~23MB to ~5MB.
++                                    const MAX_OCR_DIM = 2000;
++                                    const origPixels = imgObj.width * imgObj.height;
++                                    if (origPixels > MAX_OCR_DIM * MAX_OCR_DIM) {
++                                        const rgbaData = convertToRgbaBuffer(imgObj.data, imgObj.width, imgObj.height, imgObj.kind);
++                                        const scaled = downscaleForOcr(new Uint8Array(rgbaData), imgObj.width, imgObj.height, MAX_OCR_DIM);
++                                        pageItems.push({
++                                            type: 'image',
++                                            x: imgX,
++                                            y: imgY,
++                                            name: imgName,
++                                            data: scaled.data,
++                                            width: scaled.width,
++                                            height: scaled.height,
++                                            kind: 3 // RGBA after conversion
++                                        });
++                                    } else {
++                                        pageItems.push({
++                                            type: 'image',
++                                            x: imgX,
++                                            y: imgY,
++                                            name: imgName,
++                                            data: imgObj.data,
++                                            width: imgObj.width,
++                                            height: imgObj.height,
++                                            kind: imgObj.kind
++                                        });
++                                    }
                                  }
                              }
-                             catch (e) {
+                         }
+@@ -562,6 +710,22 @@ const parsePdf = async (buffer, config) => {
+     }
+     // Calculate font statistics for heading detection
+     const fontStats = calculateFontStats(allPageItems);
++    // Count tasks for progress tracking
++    let totalTasks = 0;
++    let processedTaskCount = 0;
++    if (config.ocr) {
++        totalTasks = allPageItems.length;
++    } else {
++        for (const pageItems of allPageItems) {
++            for (const item of pageItems) {
++                if (item.type === 'image') totalTasks++;
++            }
++        }
++    }
++    if (totalTasks > 5) {
++        const typeStr = config.ocr ? "pages" : "images";
++        console.log(`📊 Processing ${totalTasks} ${typeStr} across ${allPageItems.length} pages. Starting...`);
++    }
+     // --- Second Pass: Process pages with font statistics ---
+     for (let i = 0; i < allPageItems.length; i++) {
+         const pageNum = i + 1;
+@@ -597,6 +761,51 @@ const parsePdf = async (buffer, config) => {
+             if (config.outputErrorToConsole)
+                 console.error(`Error extracting annotations from page ${pageNum}:`, e);
+         }
++        // --- Full Page OCR (Colab Style) ---
++        // We render the entire slide as one image and OCR it to capture everything (headers, graphics, etc.)
++        if (config.ocr) {
++            processedTaskCount++;
++            try {
++                process.stdout.write(`\r[OCR] Rendering & OCRing page ${pageNum}/${allPageItems.length}...    `);
++                const pageImg = await renderPageToImage(page, 2400);
++                // Optional debug: when OFFICEPARSER_DEBUG_OCR is set, dump the rendered
++                // page image to disk so we can visually verify rendering before OCR.
++                if (process.env.OFFICEPARSER_DEBUG_OCR) {
++                    try {
++                        const fs = require('fs');
++                        const path = require('path');
++                        const debugDir = process.env.OFFICEPARSER_DEBUG_OCR_DIR || process.cwd();
++                        const debugPath = path.join(debugDir, `debug_page_${pageNum}.png`);
++                        fs.writeFileSync(debugPath, pageImg.pngBuffer);
++                        console.log(`\r[OCR] Debug: wrote ${debugPath} (${pageImg.pngBuffer.length} bytes, ${pageImg.width}x${pageImg.height})`);
++                    } catch (dbgErr) {
++                        console.warn(`\r[OCR] Debug write failed:`, dbgErr);
++                    }
++                }
++                const OCR_TIMEOUT_MS = 180000; // 180s max per page (higher res = longer OCR)
++                const ocrPromise = (0, ocrUtils_js_1.performOcr)(pageImg.pngBuffer, { language: config.ocrLanguage, ...config.ocrConfig });
++                const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error(`OCR timeout`)), OCR_TIMEOUT_MS));
++                try {
++                    const ocrResult = await Promise.race([ocrPromise, timeoutPromise]);
++                    if (ocrResult && ocrResult.trim().length > 0) {
++                        pageContent.push({
++                            type: 'text',
++                            text: `\n[Page ${pageNum} OCR Content]\n${ocrResult.trim()}\n`,
++                            height: 0,
++                            y: -9999, // Place at bottom or effectively ignored by sorter
++                            x: 0
++                        });
++                    }
++                }
++                catch (timeoutErr) {
++                    console.warn(`\r⚠️ OCR timed out for page ${pageNum} — skipping.`);
++                }
++            }
++            catch (e) {
++                if (config.outputErrorToConsole)
++                    console.error(`\r[OCR] Page OCR failed for page ${pageNum}:`, e);
++            }
++        }
+         // Sort items: Y descending (top to bottom), then X ascending (left to right)
+         pageItems.sort((a, b) => {
+             // Relax tolerance slightly (5 -> 7) for PDF.js 5.x coordinate precision
+@@ -725,6 +934,11 @@ const parsePdf = async (buffer, config) => {
+                     currentNode = null;
+                 }
+                 imageCounter++;
++                // Log progress only if NOT doing Page OCR (to avoid log spam/conflicts)
++                if (!config.ocr && totalTasks > 5) {
++                    processedTaskCount++;
++                    process.stdout.write(`\r[OCR] Processing image ${processedTaskCount}/${totalTasks} (page ${pageNum}/${allPageItems.length})...    `);
++                }
+                 // Note: Using .bmp extension since we encode to BMP for broad compatibility
+                 const attachmentName = `pdf_image_p${pageNum}_${imageCounter}.bmp`;
+                 /**
+@@ -735,23 +949,11 @@ const parsePdf = async (buffer, config) => {
+                 if (config.extractAttachments) {
+                     try {
+                         const imageBuffer = convertToRgbaBuffer(item.data, item.width, item.height, item.kind);
+-                        // Encode as BMP
++                        // Encode color BMP for attachment storage
+                         const bmpBuffer = encodeBmp(item.width, item.height, new Uint8Array(imageBuffer));
+                         const attachment = (0, imageUtils_js_1.createAttachment)(attachmentName, bmpBuffer);
+                         attachment.mimeType = 'image/bmp';
+-                        // Perform OCR if enabled
+-                        if (config.ocr) {
+-                            try {
+-                                // Skip OCR for very small images/artifacts (e.g. < 10px) to avoid Tesseract warnings
+-                                if (item.width >= 10 && item.height >= 10) {
+-                                    attachment.ocrText = (await (0, ocrUtils_js_1.performOcr)(bmpBuffer, { language: config.ocrLanguage, ...config.ocrConfig })).trim();
+-                                }
+-                            }
+-                            catch (e) {
+-                                if (config.outputErrorToConsole)
+-                                    console.error(`OCR failed for ${attachmentName}:`, e);
+-                            }
+-                        }
++                        // Individual image OCR is disabled in favor of Full-Page OCR for better accuracy
+                         attachments.push(attachment);
+                         // Create image content node
+                         const imageMetadata = {
 diff --git a/node_modules/officeparser/dist/utils/ocrUtils.js b/node_modules/officeparser/dist/utils/ocrUtils.js
-index 4ccdb43..93812f8 100644
+index 4ccdb43..a49004a 100644
 --- a/node_modules/officeparser/dist/utils/ocrUtils.js
 +++ b/node_modules/officeparser/dist/utils/ocrUtils.js
 @@ -27,7 +27,7 @@ class OcrSchedulerManager {
@@ -24,7 +306,7 @@ index 4ccdb43..93812f8 100644
      pool = [];
      queue = [];
 -    MAX_WORKERS = 4;
-+    MAX_WORKERS = 1; // Changed to 1 to prevent Tesseract race conditions
++    MAX_WORKERS = 3; // Parallel workers for large documents (200+ slides)
      idleTimeout = 10000; // 10s default
      timeoutId = null;
      constructor() { }
@@ -44,3 +326,21 @@ index 4ccdb43..93812f8 100644
                  if (nextJob.config.workerPath)
                      options.workerPath = nextJob.config.workerPath;
                  if (nextJob.config.corePath)
+@@ -102,6 +109,17 @@ class OcrSchedulerManager {
+                 if (nextJob.config.langPath)
+                     options.langPath = nextJob.config.langPath;
+                 const worker = await createWorker(requestedLanguage, 1, options);
++                // OCR tuning for slide-style PDFs:
++                // - PSM 11 ("sparse text"): finds as much text as possible without
++                //   trying to enforce a strict layout model. This rescues bold
++                //   sub-headers and stylized titles that auto-segmentation (PSM 3)
++                //   tends to drop on multi-panel slide layouts.
++                // - preserve_interword_spaces: keeps multi-column slides readable
++                //   (without it PSM 11 sometimes mashes columns together).
++                await worker.setParameters({
++                    tessedit_pageseg_mode: '11',
++                    preserve_interword_spaces: '1',
++                });
+                 managed = {
+                     worker,
+                     language: requestedLanguage,

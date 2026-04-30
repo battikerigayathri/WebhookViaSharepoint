@@ -4,3 +4,15 @@ dist
 *.log
 *.pdf
 parsed_*.txt
+
+# Runtime state (per-environment, regenerated)
+delta_link.json
+processed_items.json
+sync-state.json
+
+# Generated discovery output
+sharepoint_folders.json
+
+# Debug PNGs from OFFICEPARSER_DEBUG_OCR
+debug_page_*.png
+debug-out/

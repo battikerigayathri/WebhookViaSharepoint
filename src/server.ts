@@ -9,6 +9,7 @@ import { OfficeParser } from "officeparser";
 import { createRequire } from "module";
 import { pathToFileURL } from "url";
 import fs from "fs";
+
 dotenv.config();
 const app = express();
 app.use(express.json());
@@ -59,7 +60,89 @@ function generateJWT() {
 }
 const processedItems = new Set<string>();
 
+// --- Processed Items Persistence ---
+// Stores item IDs of documents we've already sent to the Embedding API,
+// keyed by item.id with their lastModifiedDateTime. This prevents duplicate
+// embeddings when SharePoint replays the same item across delta calls or
+// when the server restarts mid-window.
+const PROCESSED_ITEMS_FILE = "processed_items.json";
+
+function loadProcessedItems(): Map<string, string> {
+  try {
+    if (fs.existsSync(PROCESSED_ITEMS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(PROCESSED_ITEMS_FILE, "utf-8"));
+      const map = new Map<string, string>(Object.entries(data));
+      console.log(`📌 Loaded ${map.size} previously processed item(s).`);
+      return map;
+    }
+  } catch {
+    console.warn("⚠️ Could not load processed items file, starting fresh.");
+  }
+  return new Map<string, string>();
+}
+
+function saveProcessedItems(map: Map<string, string>) {
+  try {
+    const obj = Object.fromEntries(map);
+    fs.writeFileSync(PROCESSED_ITEMS_FILE, JSON.stringify(obj, null, 2));
+  } catch (err) {
+    console.error("❌ Failed to save processed items:", err);
+  }
+}
+
+const persistedProcessedItems: Map<string, string> = loadProcessedItems();
+
+// Server startup timestamp — only files created AFTER this time will be processed.
+// This prevents pre-existing files from being re-synced on every server restart.
+const SERVER_START_TIME = new Date();
+console.log(`🕒 Server start time: ${SERVER_START_TIME.toISOString()} — only files uploaded after this will be synced.`);
+
+// --- Delta Link Persistence ---
+// Stores the last deltaLink so we only get NEW changes after a restart,
+// instead of replaying the entire folder history (which includes deleted items).
+const DELTA_LINK_FILE = "delta_link.json";
+
+function loadDeltaLink(): string | null {
+  try {
+    if (fs.existsSync(DELTA_LINK_FILE)) {
+      const data = JSON.parse(fs.readFileSync(DELTA_LINK_FILE, "utf-8"));
+      console.log("📌 Loaded saved deltaLink — will only fetch new changes.");
+      return data.deltaLink || null;
+    }
+  } catch {
+    console.warn("⚠️ Could not load delta link file, starting fresh.");
+  }
+  return null;
+}
+
+function saveDeltaLink(deltaLink: string) {
+  try {
+    fs.writeFileSync(DELTA_LINK_FILE, JSON.stringify({ deltaLink, savedAt: new Date().toISOString() }));
+    console.log("💾 Saved deltaLink for next sync.");
+  } catch (err) {
+    console.error("❌ Failed to save deltaLink:", err);
+  }
+}
+
+let cachedDeltaLink: string | null = loadDeltaLink();
+
+// Prevents concurrent sync runs (webhook + polling race condition)
+let isSyncing = false;
+
 async function handleSharePointChange(notification: any) {
+  if (isSyncing) {
+    console.log("⏳ Sync already in progress, skipping this trigger.");
+    return;
+  }
+  isSyncing = true;
+  try {
+    await _handleSharePointChange(notification);
+  } finally {
+    isSyncing = false;
+  }
+}
+
+async function _handleSharePointChange(notification: any) {
   const token = await getAccessToken();
   if (!token) return;
   const client = Client.init({
@@ -71,14 +154,69 @@ async function handleSharePointChange(notification: any) {
     console.log("Fetching specific changes from SharePoint...");
     const driveId = process.env.SHAREPOINT_DRIVE_ID;
     const folderId = process.env.SHAREPOINT_FOLDER_ID;
-    const response = await client.api(`/drives/${driveId}/items/${folderId}/delta`).get();
-    const changes = response.value;
-    if (changes && changes.length > 0) {
-      const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
-      for (const item of changes) {
+
+    // Use the saved deltaLink if available, otherwise start a fresh delta query
+    let url: string;
+    if (cachedDeltaLink) {
+      url = cachedDeltaLink;
+      console.log("🔄 Using saved deltaLink to fetch only NEW changes...");
+    } else {
+      url = `/drives/${driveId}/items/${folderId}/delta`;
+      console.log("🆕 No deltaLink saved — fetching full delta (first run)...");
+    }
+
+    // Collect all changes across paginated responses
+    let allChanges: any[] = [];
+    let nextLink: string | null = url;
+    let newDeltaLink: string | null = null;
+
+    while (nextLink) {
+      const response = cachedDeltaLink && nextLink === url
+        ? await axios.get(nextLink, { headers: { Authorization: `Bearer ${token}` } }).then(r => r.data)
+        : await client.api(nextLink).get();
+
+      if (response.value) {
+        allChanges = allChanges.concat(response.value);
+      }
+
+      // Follow pagination
+      if (response["@odata.nextLink"]) {
+        nextLink = response["@odata.nextLink"];
+        cachedDeltaLink = null; // Reset so next iteration uses client.api
+      } else {
+        newDeltaLink = response["@odata.deltaLink"] || null;
+        nextLink = null;
+      }
+    }
+
+    // Save the new deltaLink so next time we only get changes after this point
+    if (newDeltaLink) {
+      cachedDeltaLink = newDeltaLink;
+      saveDeltaLink(newDeltaLink);
+    }
+
+    if (allChanges.length > 0) {
+      console.log(`📊 Delta returned ${allChanges.length} item(s). Filtering...`);
+      for (const item of allChanges) {
+
+        // ✅ SKIP DELETED ITEMS — the delta API returns items with a "deleted"
+        // facet when they've been removed from the folder.
+        if (item.deleted) {
+          console.log(`🗑️ Skipping deleted item: "${item.name || item.id}"`);
+          continue;
+        }
+
         const createdDate = new Date(item.createdDateTime);
-        if (createdDate > fiveMinutesAgo && item.file) {
+        if (createdDate > SERVER_START_TIME && item.file) {
           if (processedItems.has(item.id)) {
+            continue;
+          }
+          // Skip if we've already processed this exact version (same lastModifiedDateTime)
+          const lastModified = item.lastModifiedDateTime || "";
+          const previouslyProcessed = persistedProcessedItems.get(item.id);
+          if (previouslyProcessed && previouslyProcessed >= lastModified) {
+            console.log(`⏭️  Skipping already-processed file: "${item.name}" (modified: ${lastModified})`);
+            processedItems.add(item.id);
             continue;
           }
           processedItems.add(item.id);
@@ -172,10 +310,10 @@ async function handleSharePointChange(notification: any) {
                 fileType: item.file.mimeType || "application/pdf"
               },
               content: parsedText,
-              collectionName: "69b01a82fde61e6ac0a7f43c",
+              collectionName: "6943a72296416fb578171fca",
               asyncProcessing: true,
-              chunkSize: 500,
-              overlap: 50,
+              chunkSize: 2000000,
+              overlap: 50000,
               returnEmbedding: false
             };
             // 2. Trigger the Embedding API
@@ -190,6 +328,10 @@ async function handleSharePointChange(notification: any) {
             });
             console.log(`✅ Embedding API Success for ${item.name}:\n`, JSON.stringify(apiResponse.data, null, 2));
 
+            // Persist this item so we don't re-process it across server restarts
+            persistedProcessedItems.set(item.id, item.lastModifiedDateTime || new Date().toISOString());
+            saveProcessedItems(persistedProcessedItems);
+
             // If the response contains chunks, they will now be fully printed in the console
             // so you can confirm if the image content was extracted correctly.
           } catch (apiError: any) {
@@ -197,6 +339,8 @@ async function handleSharePointChange(notification: any) {
           }
         }
       }
+    } else {
+      console.log("✅ No new changes detected.");
     }
   } catch (error: any) {
     console.error("Error tracing changes:", error.body || error);

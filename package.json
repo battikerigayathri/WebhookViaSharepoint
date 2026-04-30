@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node dist/index.js",
-    "dev": "tsx src/index.ts",
+    "dev": "set NODE_OPTIONS=--max-old-space-size=4096 && tsx src/index.ts",
     "build": "tsc",
     "subscribe": "tsx src/subscription.ts",
     "resolve-ids": "tsx src/resolve-ids.ts",
@@ -29,7 +29,9 @@
   "dependencies": {
     "@azure/msal-node": "^5.1.4",
     "@microsoft/microsoft-graph-client": "^3.0.7",
+    "@napi-rs/canvas": "^0.1.100",
     "axios": "^1.15.2",
+    "canvas": "^3.2.3",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "officeparser": "^6.1.0",
